@@ -4,6 +4,9 @@ using Microsoft.Identity.Client;
 
 namespace MinimalApi.Services;
 
+/// <summary>
+/// Implements the 'Read, Retrieve, Read' RAG Pattern
+/// </summary>
 public class ReadRetrieveReadChatService
 {
     private readonly SearchClient _searchClient;
@@ -34,6 +37,15 @@ public class ReadRetrieveReadChatService
             ArgumentNullException.ThrowIfNullOrWhiteSpace(endpoint);
 
             // Add Azure text embedding generation service to the kernel instance
+            // Note the third parameter: DefaultAzureCredential() is used to authenticate the service.
+            // It cycles through the available authentication methods in the following order:
+            // 1. Environment variables
+            // 2. Managed Identity
+            // 3. Visual Studio
+            // 4. Visual Studio Code
+            // 5. Azure CLI
+            // 6. Azure AD Integrated Authentication
+            // 7. Interactive Browser Login
             kernelBuilder = kernelBuilder.WithAzureTextEmbeddingGenerationService(embeddingModelName, endpoint, new DefaultAzureCredential());
         }
         _kernel = kernelBuilder.Build();
@@ -47,20 +59,24 @@ public class ReadRetrieveReadChatService
     {
         try
         {
+            //*************************************************
+            // Prepare parameters for the search
+            //*************************************************
+
             // Set the value of 'top' based on the value of 'overrides.Top' or default to 3
             var top = overrides?.Top ?? 3;
 
-            // Set the value of 'useSemanticCaptions' based on the value of 'overrides.SemanticCaptions' or default to false
+            // Semantic Captions: Verbatim sentences and phrases from a document that best summarize the content of the document.
             var useSemanticCaptions = overrides?.SemanticCaptions ?? false;
 
-            // Set the value of 'useSemanticRanker' based on the value of 'overrides.SemanticRanker' or default to false
+            // Semantic Ranking: Adds secondary ranking based on semantic similarity to the query.
+            // Extracts the most relevant sentences from the top documents and ranks them based on their semantic similarity to the query.
             var useSemanticRanker = overrides?.SemanticRanker ?? false;
 
             // Set the value of 'excludeCategory' based on the value of 'overrides.ExcludeCategory' or default to null
             var excludeCategory = overrides?.ExcludeCategory ?? null;
 
-            // Set the value of 'filter' based on the value of 'excludeCategory'
-            // If 'excludeCategory' is null, 'filter' should be null, otherwise it should be a string with the appropriate condition
+            // Filter to exclude specific categories from the search results
             var filter = excludeCategory is null ? null : $"category ne '{excludeCategory}'";
 
             // Get the 'chat' service instance from the '_kernel' service
@@ -69,7 +85,7 @@ public class ReadRetrieveReadChatService
             // Get the 'embedding' service instance from the '_kernel' service
             ITextEmbeddingGeneration? embedding = _kernel.GetService<ITextEmbeddingGeneration>();
 
-            // Initialize 'embeddings' as null
+            // Initialize variable to cpature the embeddings of the user's prompt
             float[]? embeddings = null;
 
             // Get the last user question from the 'history' array and store it in the 'question' variable
@@ -85,22 +101,35 @@ public class ReadRetrieveReadChatService
             }
 
             //*************************************************
-            // step 1
-            // use llm to get query if retrieval mode is not vector
-            //*************************************************
+            // step 1: Read
+            // LLM reads user's query and calls LLM to refine
+            // query for search proces
+            // *************************************************
+
+            // Initialize variable to capture the prompt
             string? query = null;
+
+            // ** We'll perform refinement step for keyword, or non-semantic, searches
+            // ** If Vector serach, then we want user's full sentence in order to understand
+            // ** full semantics for the question and forge the keyword refinement step.
             if (overrides?.RetrievalMode != "Vector")
             {
+                // Constructs a Kernel ChatQuery instance with the following prompt
                 var getQueryChat = chat.CreateNewChat(@"You are a helpful AI assistant, generate search query for followup question.
 Make your respond simple and precise. Return the query only, do not return any other text.
 e.g.
 Northwind Health Plus AND standard plan.
 standard plan AND dental AND employee benefit.
 ");
-
+                // Add the users current question to the 'getQueryChat' instance
+                // ** Note how no history is added to the 'getQueryChat' instance **
+                // Only the current question is added to the 'getQueryChat' instance
                 getQueryChat.AddUserMessage(question);
+
+                // Call to the Kernel, which calls OpenAI's 'GetChatCompletionsAsync' method
+                // for a refined version of the user's question.
                 var result = await chat.GetChatCompletionsAsync(
-                    getQueryChat,
+                    getQueryChat, // passes in prompt tempate which contain instuctions and the data
                     cancellationToken: cancellationToken);
 
                 if (result.Count != 1)
@@ -108,16 +137,22 @@ standard plan AND dental AND employee benefit.
                     throw new InvalidOperationException("Failed to get search query");
                 }
 
+                // assign refined query to query variable
                 query = result[0].ModelResult.GetOpenAIChatResult().Choice.Message.Content;
             }
 
             //*************************************************
-            // step 2
-            // use query to search related docs
-            //*******************************************
+            // step 2: Retrieve
+            // use query to search relevant data or documents
+            //*************************************************
+
+            // Call to searchClient returns a list of relevant documents
+            // Well pass the list of documents back to the calling client
             var documentContentList = await _searchClient.QueryDocumentsAsync(query, embeddings, overrides, cancellationToken);
 
             string documentContents = string.Empty;
+
+            // Concatenate the title and content of each document in the 'documentContentList' array
             if (documentContentList.Length == 0)
             {
                 documentContents = "no source available.";
@@ -127,9 +162,17 @@ standard plan AND dental AND employee benefit.
                 documentContents = string.Join("\r", documentContentList.Select(x => $"{x.Title}:{x.Content}"));
             }
 
-            Console.WriteLine(documentContents);
-            // step 3
-            // put together related docs and conversation history to generate answer
+            // Print the 'documentContents' to the console for debugging purposes
+            //Console.WriteLine(documentContents);
+
+            //*************************************************
+            // step 3: Read
+            // LLM reads/analyzes retrieved content.
+            // LLM formulates a comprehensive response.
+            // The response is set back to the user.
+            //*************************************************
+
+            // Constructs a Kernel ChatQuery instance with the following prompt
             var answerChat = chat.CreateNewChat(
                 "You are a system assistant who helps the company employees with their healthcare " +
                 "plan questions, and questions about the employee handbook. Be brief in your answers");
@@ -137,14 +180,26 @@ standard plan AND dental AND employee benefit.
             // add chat history
             foreach (var turn in history)
             {
+                // add each user message to answerChat instance
                 answerChat.AddUserMessage(turn.User);
+
+                // C# Pattern Matching:
+                // If the 'turn.Bot' is compatible with type botMessage
+                // If so, then assign the value of 'turn.Bot' to the 'botMessage' variable
+                // And, if true, then add the 'botMessage' to the 'answerChat' instance
                 if (turn.Bot is { } botMessage)
                 {
                     answerChat.AddAssistantMessage(botMessage);
                 }
             }
 
-            // format prompt
+            // Add a prompt template
+            // Note how the 'documentContents' (from step 2) is embdded into the prompt
+            // Note how it requests the answer in a json object format
+            // Using Natural Language, it then asks the LLM to:
+            //    Provide the answer (document) to the user question
+            //    Describe how it determined the answer
+            // Show the power of Prompt Engineering
             answerChat.AddUserMessage(@$" ## Source ##
 {documentContents}
 ## End ##
@@ -155,24 +210,39 @@ You answer needs to be a json object with the following format.
     ""thoughts"": // brief thoughts on how you came up with the answer, e.g. what sources you used, what you thought about, etc.
 }}");
 
-            // get answer
+            // Call the model using Semantic Kernel to execute the instructions from the prompt
             var answer = await chat.GetChatCompletionsAsync(
-                           answerChat,
+                           answerChat, // passes in prompt tempate which contain instuctions and the data
                            cancellationToken: cancellationToken);
+
+            //** Extract the content portion of the Semantic Kernel response
             var answerJson = answer[0].ModelResult.GetOpenAIChatResult().Choice.Message.Content;
+
+            //** Deserialize the json object
             var answerObject = JsonSerializer.Deserialize<JsonElement>(answerJson);
+
+            //** Extract the answer portion of the Semantic Kernel response
             var ans = answerObject.GetProperty("answer").GetString() ?? throw new InvalidOperationException("Failed to get answer");
-            //var thoughts = answerObject.GetProperty("thoughts").GetString() ?? throw new InvalidOperationException("Failed to get thoughts");
+            
+            //Console.WriteLine(answer);
+            //var test = $"Searched for:<br>{query}<br>"; //<br>Prompt:<br>{prompt.Replace("\n", "<br>")}",
 
-            var test = $"Searched for:<br>{query}<br>"; //<br>Prompt:<br>{prompt.Replace("\n", "<br>")}",
-
+            //** Extract the thought portion of the Semantic Kernel response
             var thoughts = answerObject.GetProperty("thoughts").GetString() ?? throw new InvalidOperationException("Failed to get thoughts");
 
+            //*************************************************
             // step 4
-            // add follow up questions if requested
+            // Put the LLM to work for value adds -- beyond the RAG pattern
+            // This is cool and shows the power of LLMs 
+            //*************************************************
+
+            // ** Instruct model to generate follow-up questions
             if (overrides?.SuggestFollowupQuestions is true)
             {
+                // Constructs a Kernel ChatQuery instance with the following prompt
                 var followUpQuestionChat = chat.CreateNewChat(@"You are a helpful AI assistant");
+
+                // Adds the prompt template -- embedding the answer portion of the previous response in step 3
                 followUpQuestionChat.AddUserMessage($@"Generate three follow-up question based on the answer you just generated.
 # Answer
 {ans}
@@ -186,12 +256,16 @@ e.g.
     ""What is the out-of-pocket maximum?""
 ]");
 
+                // Call the model using Semantic Kernel to execute the instructions from the prompt
                 var followUpQuestions = await chat.GetChatCompletionsAsync(
-                    followUpQuestionChat,
+                    followUpQuestionChat, // passes in prompt tempate which contain instuctions and the data
                     cancellationToken: cancellationToken);
 
+                // Same pattern in step 3
                 var followUpQuestionsJson = followUpQuestions[0].ModelResult.GetOpenAIChatResult().Choice.Message.Content;
                 var followUpQuestionsObject = JsonSerializer.Deserialize<JsonElement>(followUpQuestionsJson);
+
+                // Flatten the json object into a list of strings
                 var followUpQuestionsList = followUpQuestionsObject.EnumerateArray().Select(x => x.GetString()).ToList();
                 foreach (var followUpQuestion in followUpQuestionsList)
                 {
